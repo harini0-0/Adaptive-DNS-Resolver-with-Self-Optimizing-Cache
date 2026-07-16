@@ -5,13 +5,17 @@ import (
 	"log"
 	"net"
 	"time"
+
+	"github.com/harini0-0/Adaptive-DNS-Resolver-with-Self-Optimizing-Cache/internal/workerpool"
 )
 
-// Server is a bare forwarding DNS resolver (no cache, no worker pool yet).
+// Server is a forwarding DNS resolver backed by a bounded worker pool.
 type Server struct {
-	Addr     string        // e.g. ":8053"
-	Upstream string        // e.g. "1.1.1.1:53"
-	Timeout  time.Duration // per-query upstream timeout
+	Addr      string        // e.g. ":8053"
+	Upstream  string        // e.g. "1.1.1.1:53"
+	Timeout   time.Duration // per-query upstream timeout
+	Workers   int           // number of concurrent query handlers
+	QueueSize int           // pending-query buffer before Submit blocks
 }
 
 func (s *Server) ListenAndServe() error {
@@ -24,7 +28,12 @@ func (s *Server) ListenAndServe() error {
 		return err
 	}
 	defer conn.Close()
-	log.Printf("DNS listening on %s, upstream %s", s.Addr, s.Upstream)
+
+	pool := workerpool.New(s.Workers, s.QueueSize)
+	defer pool.Close()
+
+	log.Printf("DNS listening on %s, upstream %s, workers=%d queue=%d",
+		s.Addr, s.Upstream, s.Workers, s.QueueSize)
 
 	buf := make([]byte, 512) // 512 = classic UDP DNS max; TCP/EDNS deferred
 	for {
@@ -33,10 +42,13 @@ func (s *Server) ListenAndServe() error {
 			log.Printf("read error: %v", err)
 			continue
 		}
-		// buf is reused on the next iteration, so copy this packet out.
+		// buf is reused on the next iteration, so copy this packet out
+		// before handing it to a worker goroutine.
 		packet := make([]byte, n)
 		copy(packet, buf[:n])
-		s.handle(conn, client, packet)
+		pool.Submit(func() {
+			s.handle(conn, client, packet)
+		})
 	}
 }
 
