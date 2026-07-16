@@ -1,0 +1,92 @@
+package cache
+
+import (
+	"testing"
+	"time"
+)
+
+func TestGetMiss(t *testing.T) {
+	c := New(2)
+	if _, _, ok := c.Get("missing"); ok {
+		t.Fatal("expected miss on empty cache")
+	}
+}
+
+func TestPutThenGet(t *testing.T) {
+	c := New(2)
+	c.Put("a", []byte("1"), time.Minute)
+
+	val, remaining, ok := c.Get("a")
+	if !ok {
+		t.Fatal("expected hit after put")
+	}
+	if string(val) != "1" {
+		t.Fatalf("got value %q, want %q", val, "1")
+	}
+	if remaining <= 0 || remaining > time.Minute {
+		t.Fatalf("remaining TTL out of range: %v", remaining)
+	}
+}
+
+func TestEvictsLeastRecentlyUsedAtCapacity(t *testing.T) {
+	c := New(2)
+	c.Put("a", []byte("1"), time.Minute)
+	c.Put("b", []byte("2"), time.Minute)
+	c.Put("c", []byte("3"), time.Minute) // capacity 2: "a" should be evicted
+
+	if _, _, ok := c.Get("a"); ok {
+		t.Fatal("expected \"a\" to be evicted")
+	}
+	if _, _, ok := c.Get("b"); !ok {
+		t.Fatal("expected \"b\" to still be present")
+	}
+	if _, _, ok := c.Get("c"); !ok {
+		t.Fatal("expected \"c\" to still be present")
+	}
+}
+
+func TestGetMovesToFront(t *testing.T) {
+	c := New(2)
+	c.Put("a", []byte("1"), time.Minute)
+	c.Put("b", []byte("2"), time.Minute)
+
+	// Touch "a" so "b" becomes the least-recently-used entry.
+	if _, _, ok := c.Get("a"); !ok {
+		t.Fatal("expected hit on \"a\"")
+	}
+	c.Put("c", []byte("3"), time.Minute) // capacity 2: "b" should be evicted, not "a"
+
+	if _, _, ok := c.Get("b"); ok {
+		t.Fatal("expected \"b\" to be evicted after \"a\" was accessed")
+	}
+	if _, _, ok := c.Get("a"); !ok {
+		t.Fatal("expected \"a\" to survive since it was recently accessed")
+	}
+}
+
+func TestExpiredEntryIsMiss(t *testing.T) {
+	c := New(2)
+	c.Put("a", []byte("1"), 10*time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+
+	if _, _, ok := c.Get("a"); ok {
+		t.Fatal("expected expired entry to be a miss")
+	}
+	if c.Len() != 0 {
+		t.Fatalf("expected expired entry to be evicted from Len(), got %d", c.Len())
+	}
+}
+
+func TestPutUpdatesExistingKey(t *testing.T) {
+	c := New(2)
+	c.Put("a", []byte("1"), time.Minute)
+	c.Put("a", []byte("2"), time.Minute)
+
+	val, _, ok := c.Get("a")
+	if !ok || string(val) != "2" {
+		t.Fatalf("expected updated value \"2\", got %q (ok=%v)", val, ok)
+	}
+	if c.Len() != 1 {
+		t.Fatalf("expected 1 entry after update, got %d", c.Len())
+	}
+}

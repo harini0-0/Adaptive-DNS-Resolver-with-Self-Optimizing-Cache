@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Header struct {
@@ -120,6 +121,79 @@ func ParseQuery(msg []byte) (*Query, error) {
 		offset = next
 	}
 	return &Query{Header: h, Questions: qs}, nil
+}
+
+// walkAnswers steps through the answer section of a raw DNS message (after
+// skipping the header and question section) and invokes fn once per resource
+// record with the byte offset of that record's 4-byte TTL field and its
+// rdlength. It stops and returns an error on any malformed record.
+func walkAnswers(msg []byte, fn func(ttlOffset, rdlength int) error) error {
+	h, err := parseHeader(msg)
+	if err != nil {
+		return err
+	}
+	offset := 12
+	for i := 0; i < int(h.QDCount); i++ {
+		_, next, err := parseQuestion(msg, offset)
+		if err != nil {
+			return err
+		}
+		offset = next
+	}
+	for i := 0; i < int(h.ANCount); i++ {
+		_, next, err := parseName(msg, offset)
+		if err != nil {
+			return err
+		}
+		offset = next
+		// fixed fields after the name: type(2) class(2) ttl(4) rdlength(2)
+		if offset+10 > len(msg) {
+			return errors.New("truncated resource record")
+		}
+		rdlength := int(binary.BigEndian.Uint16(msg[offset+8 : offset+10]))
+		if err := fn(offset+4, rdlength); err != nil {
+			return err
+		}
+		offset += 10 + rdlength
+		if offset > len(msg) {
+			return errors.New("truncated resource record data")
+		}
+	}
+	return nil
+}
+
+// ExtractTTL returns the minimum TTL among a response's answer records. ok is
+// false if there are no answer records (e.g. NXDOMAIN) or the message can't
+// be walked.
+func ExtractTTL(resp []byte) (ttl time.Duration, ok bool) {
+	var minSecs uint32
+	err := walkAnswers(resp, func(ttlOffset, _ int) error {
+		secs := binary.BigEndian.Uint32(resp[ttlOffset : ttlOffset+4])
+		if !ok || secs < minSecs {
+			minSecs = secs
+			ok = true
+		}
+		return nil
+	})
+	if err != nil || !ok {
+		return 0, false
+	}
+	return time.Duration(minSecs) * time.Second, true
+}
+
+// PatchTTLs returns a copy of resp with every answer record's TTL field
+// rewritten to newTTL. The original slice is left untouched, since cached
+// responses are shared across concurrent readers.
+func PatchTTLs(resp []byte, newTTL time.Duration) []byte {
+	out := make([]byte, len(resp))
+	copy(out, resp)
+
+	secs := uint32(newTTL / time.Second)
+	_ = walkAnswers(out, func(ttlOffset, _ int) error {
+		binary.BigEndian.PutUint32(out[ttlOffset:ttlOffset+4], secs)
+		return nil
+	})
+	return out
 }
 
 // TypeName maps common record type numbers to names for logging.
